@@ -123,7 +123,7 @@ python src/main.py
 
 You can use an IDE like PyCharm to develop and debug your code.
 
-# Clean Up
+## Clean Up
 To remove all resources created by Terraform, run:
 ```bash
 terraform destroy
