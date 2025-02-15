@@ -74,9 +74,9 @@ def lambda_handler(event=None, context=None):
     game_info = game_today(DYNAMODB_REG_TABLE)
     if game_info:
         game_time, game_venue = game_info
-        message += f'\nИ мы играем в {game_time} в {game_venue}!'
+        message += f' И мы играем в {game_time} в {game_venue}!'
     else:
-        message += '\nКвиза сегодня нет :('
+        message += ' Квиза сегодня нет :('
 
     send_message(BOT_TOKEN, GROUP_ID, message)
     return
