@@ -5,7 +5,7 @@ This project deploys an AWS Lambda function that sends Telegram notifications ab
 ## Table of Contents
 - [Project Structure](#project-structure)
 - [Prerequisites](#prerequisites)
-- [Setup Instructions](#setup-instructions)
+- [Setup](#setup)
 - [How It Works](#how-it-works)
 - [Environment Variables](#environment-variables)
 - [Local Development](#local-development)
@@ -20,8 +20,10 @@ This project deploys an AWS Lambda function that sends Telegram notifications ab
 │   └── (other source files or folders)
 └── terraform
     ├── main.tf                # Terraform configuration
+    ├── variables.tf           # Input variables
     ├── backend.hcl            # Backend configuration (not committed; see below)
     └── (other Terraform files)
+├── README.md
 ```
 
 - **src**: Contains the Lambda function source code and the dependency definition.
@@ -35,7 +37,7 @@ This project deploys an AWS Lambda function that sends Telegram notifications ab
 - [Python 3.11+](https://www.python.org/)
 - [pip](https://pip.pypa.io/en/stable/)
 
-## Setup Instructions
+## Setup
 
 ### 1. Clone the Repository
 
@@ -68,6 +70,7 @@ use_lockfile = true
 **Create a `terraform.tfvars` file with the necessary variables. Example**:
 
 ```hcl
+aws_profile        = "your_aws_profile"
 bot_token          = "your_bot_token"
 group_id           = "your_group_id"
 dynamodb_reg_table = "your_dynamodb_table"
