@@ -70,10 +70,11 @@ use_lockfile = true
 **Create a `terraform.tfvars` file with the necessary variables. Example**:
 
 ```hcl
-aws_profile        = "your_aws_profile"
-bot_token          = "your_bot_token"
-group_id           = "your_group_id"
-dynamodb_reg_table = "your_dynamodb_table"
+aws_credentials_file = "~/.aws/credentials"
+aws_profile          = "your_aws_profile"
+bot_token            = "your_bot_token"
+group_id             = "your_group_id"
+dynamodb_reg_table   = "your_dynamodb_table"
 ```
 
 ### 4. Initialize Terraform
