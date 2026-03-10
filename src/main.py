@@ -1,7 +1,7 @@
 import logging
 import os
+from contextlib import closing
 
-import boto3
 import pendulum as pdl
 import requests as req
 
@@ -15,36 +15,53 @@ logger.setLevel(logging.INFO)
 # Set up constants
 BOT_TOKEN = os.environ['BOT_TOKEN']
 GROUP_ID = os.environ['GROUP_ID']
-DYNAMODB_REG_TABLE = os.environ['DYNAMODB_REG_TABLE']
 
-# Initialize a DynamoDB client
-dynamodb = boto3.client('dynamodb')
 
-def game_today(_table):
+def get_db_connection():
+    try:
+        import psycopg2
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            'psycopg2 is not installed. Install src/requirements.txt before running the Lambda locally.'
+        ) from exc
+
+    return psycopg2.connect(
+        host=os.environ['DB_HOST'],
+        port=os.environ.get('DB_PORT', '5432'),
+        database=os.environ['DB_NAME'],
+        user=os.environ['DB_USER'],
+        password=os.environ['DB_PASSWORD'],
+    )
+
+
+def game_today():
     """
     Loads today's game time and venue if we have a game today.
     """
     try:
-        response = dynamodb.query(
-            TableName=_table,
-            IndexName='game_date_index',
-            KeyConditionExpression='game_date = :val',
-            ProjectionExpression='game_time, game_venue, is_poll_created',
-            ExpressionAttributeValues={':val': {'S': pdl.today().to_date_string()}}
-        )
-        attrs = [[x['game_time']['S'],
-                  x['game_venue']['S']]
-                 for x in response['Items'] if x['is_poll_created']['N'] == '1'
-                 ]
-        if attrs:
-            logger.info(f'Today we play at {attrs[0][0]} at {attrs[0][1]}')
-            return attrs[0]
-        else:
-            logger.info('No game today')
-            return None
+        with closing(get_db_connection()) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT game_time, game_venue
+                    FROM quizplease.game_registration_overview
+                    WHERE game_date = %s
+                      AND is_poll_created = TRUE
+                    ORDER BY game_time NULLS LAST, game_id
+                    LIMIT 1
+                    """,
+                    (pdl.today().to_date_string(),),
+                )
+                game_info = cursor.fetchone()
 
-    except Exception as e:
-        logger.error(f'Failed to load game info: {e}')
+        if game_info:
+            logger.info(f'Today we play at {game_info[0]} at {game_info[1]}')
+            return game_info
+
+        logger.info('No game today')
+        return None
+    except Exception:
+        logger.exception('Failed to load game info')
         return None
 
 
@@ -58,7 +75,8 @@ def send_message(_bot_token, _group_id, _message):
 
     if response.status_code == 200:
         message_data = response.json()
-        logger.info(f'Message sent successfully! Message: {message_data["result"]["text"]}')
+        logger.info(f'Message sent successfully! Message ID: {message_data["result"]["message_id"]}, '
+                    f'Text: {message_data["result"]["text"]}')
         return message_data['result']
     else:
         logger.error(f'Failed to send message. Status code: {response.status_code}')
@@ -71,7 +89,7 @@ def lambda_handler(event=None, context=None):
     Main function.
     """
     message = f"@applebruin Доброе утро! Сегодня {pdl.today().format('dddd', locale='ru')}."
-    game_info = game_today(DYNAMODB_REG_TABLE)
+    game_info = game_today()
     if game_info:
         game_time, game_venue = game_info
         message += f' И мы играем в {game_time} в {game_venue}!'

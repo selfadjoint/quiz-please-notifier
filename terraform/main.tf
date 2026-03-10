@@ -47,28 +47,6 @@ resource "aws_iam_role_policy_attachment" "lambda_policy_attachment" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
-resource "aws_iam_role_policy" "dynamodb_policy" {
-  name = var.resource_name
-  role = aws_iam_role.lambda_execution_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17",
-    Statement = [
-      {
-        Effect = "Allow",
-        Action = [
-          "dynamodb:GetItem",
-          "dynamodb:Query"
-        ],
-        Resource = [
-          var.dynamodb_reg_table_arn,             # Allow access to the registration data table created separately
-          "${var.dynamodb_reg_table_arn}/index/*" # Allow access to the GSIs in the registration data table
-        ]
-      }
-    ]
-  })
-}
-
 resource "aws_lambda_function" "notifier" {
   description      = "Game notifier"
   function_name    = var.resource_name
@@ -81,9 +59,13 @@ resource "aws_lambda_function" "notifier" {
 
   environment {
     variables = {
-      BOT_TOKEN          = var.bot_token
-      GROUP_ID           = var.group_id
-      DYNAMODB_REG_TABLE = var.dynamodb_reg_table_name
+      BOT_TOKEN   = var.bot_token
+      GROUP_ID    = var.group_id
+      DB_HOST     = var.db_host
+      DB_PORT     = var.db_port
+      DB_NAME     = var.db_name
+      DB_USER     = var.db_user
+      DB_PASSWORD = var.db_password
     }
   }
 
