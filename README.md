@@ -1,6 +1,6 @@
 # Quiz Game Notifier
 
-This project deploys an AWS Lambda function that sends Telegram notifications about Quiz Please game schedules. The function retrieves game data from PostgreSQL and sends a formatted message using a Telegram bot. Deployment is managed via Terraform.
+This project deploys an AWS Lambda function that sends daily Telegram notifications about Quiz Please game schedules, accompanied by a random "Что? Где? Когда?" trivia question. The function retrieves game data from PostgreSQL, fetches a question from [db.chgk.info](https://db.chgk.info/), and sends the answer later in the day as a reply. Deployment is managed via Terraform.
 
 ## Table of Contents
 - [Project Structure](#project-structure)
@@ -17,21 +17,24 @@ This project deploys an AWS Lambda function that sends Telegram notifications ab
 ├── src
 │   ├── main.py                # Lambda function code
 │   ├── requirements.txt       # Python dependency definitions
-│   └── (other source files or folders)
-└── terraform
-    ├── main.tf                # Terraform configuration
-    ├── variables.tf           # Input variables
-    ├── backend.hcl            # Backend configuration (not committed; see below)
-    └── (other Terraform files)
-├── README.md
+│   └── (vendored dependencies)
+├── terraform
+│   ├── main.tf                # Terraform configuration
+│   ├── variables.tf           # Input variables
+│   ├── backend.hcl            # Backend configuration (not committed; see below)
+│   └── (other Terraform files)
+├── migrations                 # SQL migration files for DB schema changes
+├── edit_message.py            # Local CLI utility to edit a sent Telegram message
+└── README.md
 ```
 
-- **src**: Contains the Lambda function source code and the dependency definition.
+- **src**: Contains the Lambda function source code and vendored dependencies.
 - **terraform**: Contains the Terraform configuration for deploying AWS resources.
+- **migrations**: Contains SQL migration files (e.g., `chgk_sent_questions` table creation).
 
 ## Prerequisites
 
-- PostgreSQL database with the migrated `quizplease` schema, including the `quizplease.game_registration_overview` view.
+- PostgreSQL database with the migrated `quizplease` schema, including the `quizplease.game_registration_overview` view and the `quizplease.chgk_sent_questions` table (see `migrations/`).
 - [AWS CLI](https://aws.amazon.com/cli/)
 - [Terraform](https://www.terraform.io/)
 - [Python 3.11+](https://www.python.org/)
@@ -108,11 +111,14 @@ Terraform uses the archive_file data source to package the entire src folder int
 - **Lambda Configuration**:
 The Lambda function is configured with a handler (`main.lambda_handler`), a runtime (`python3.11`), and environment variables (e.g., `BOT_TOKEN`, `GROUP_ID`, `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`). These variables are used by your Python code to send notifications and query PostgreSQL.
 
-- **Database Lookup**:
-The Lambda queries `quizplease.game_registration_overview` for today's game where `is_poll_created = TRUE`, then includes the time and venue in the Telegram message if a matching record exists.
+- **Morning Trigger (06:00 UTC — `send_question`)**:
+The Lambda queries `quizplease.game_registration_overview` for today's game, fetches a random "Что? Где? Когда?" question from [db.chgk.info](https://db.chgk.info/) (type 1 only, retrying if already sent), and sends a single Telegram message with the game info and the trivia question. The question and Telegram `message_id` are saved to `quizplease.chgk_sent_questions` for later reply. If question fetching fails, the game notification is still sent.
+
+- **Noon Trigger (12:00 UTC — `send_answer`)**:
+The Lambda looks up today's unanswered question in `quizplease.chgk_sent_questions`, sends the answer (with optional comment) as a reply to the morning message, and marks it as answered.
 
 - **IAM & CloudWatch**:
-Terraform creates an IAM role for basic Lambda execution logging and sets up a CloudWatch Events rule to trigger the Lambda function on schedule.
+Terraform creates an IAM role for basic Lambda execution logging and sets up two CloudWatch Events rules: one at 06:00 UTC (question) and one at 12:00 UTC (answer), each passing the corresponding `action` in the event payload.
 
 ## Environment Variables
 The Lambda function expects the following environment variables, which are set in the Terraform configuration:

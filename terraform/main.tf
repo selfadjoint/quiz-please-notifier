@@ -82,7 +82,7 @@ resource "aws_lambda_permission" "allow_execution" {
 
 resource "aws_cloudwatch_event_rule" "schedule_rule" {
   name                = var.resource_name
-  description         = "Scheduled rule to notify about games"
+  description         = "Scheduled rule to notify about games and send ЧГК question"
   schedule_expression = "cron(0 6 ? * * *)" # Runs every day at 06:00 UTC
 }
 
@@ -90,4 +90,27 @@ resource "aws_cloudwatch_event_target" "lambda_target" {
   rule      = aws_cloudwatch_event_rule.schedule_rule.name
   target_id = var.resource_name
   arn       = aws_lambda_function.notifier.arn
+  input     = jsonencode({ "action" : "send_question" })
+}
+
+# ЧГК answer trigger at 12:00 UTC (15:00 Moscow)
+resource "aws_cloudwatch_event_rule" "answer_rule" {
+  name                = "${var.resource_name}-answer"
+  description         = "Scheduled rule to send ЧГК answer"
+  schedule_expression = "cron(0 12 ? * * *)" # Runs every day at 12:00 UTC
+}
+
+resource "aws_cloudwatch_event_target" "answer_target" {
+  rule      = aws_cloudwatch_event_rule.answer_rule.name
+  target_id = "${var.resource_name}-answer"
+  arn       = aws_lambda_function.notifier.arn
+  input     = jsonencode({ "action" : "send_answer" })
+}
+
+resource "aws_lambda_permission" "allow_answer_execution" {
+  statement_id  = "AllowExecutionFromCloudWatchAnswer"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.notifier.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.answer_rule.arn
 }
