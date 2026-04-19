@@ -21,6 +21,11 @@ GROUP_ID = os.environ['GROUP_ID']
 CHGK_RANDOM_URL = 'https://db.chgk.info/xml/random/types1/limit1'
 CHGK_MAX_RETRIES = 10
 
+# gotquestions.online: ~250k questions with sequential IDs; we pick a random ID from 1..MAX_GQ_QUESTION_ID
+GQ_QUESTION_URL = 'https://gotquestions.online/question/{qid}'
+GQ_MAX_QUESTION_ID = 240_000
+GQ_MAX_RETRIES = 5
+
 
 def get_db_connection():
     try:
@@ -108,15 +113,42 @@ def _clean_html(text):
 
 def fetch_random_question():
     """
-    Fetches a random ЧГК question from db.chgk.info that has not been sent before.
-    Returns a dict with question_id, question_text, answer_text, comment_text or None.
+    Fetches a random ЧГК question from multiple sources, trying each in order:
+    1. db.chgk.info XML API (primary)
+    2. gotquestions.online HTML scraping (secondary)
+    3. DB pool — a previously fetched but never-sent question (fallback)
+    Returns a dict with question_id, question_text, answer_text, comment_text, source or None.
     """
+    sources = [
+        ('db.chgk.info', _fetch_from_dbchgk),
+        ('gotquestions.online', _fetch_from_gotquestions),
+        ('db_pool', _fetch_from_db_pool),
+    ]
+    for source_name, fetcher in sources:
+        try:
+            question = fetcher()
+            if question:
+                question['source'] = source_name
+                logger.info('Fetched question %s from %s', question['question_id'], source_name)
+                return question
+        except Exception:
+            logger.exception('Source %s failed', source_name)
+    logger.error('All question sources exhausted')
+    return None
+
+
+def _fetch_from_dbchgk():
+    """Fetch a random ЧГК question from db.chgk.info XML API (original source)."""
+    import random as _rnd
+
     for attempt in range(1, CHGK_MAX_RETRIES + 1):
         try:
             resp = req.get(CHGK_RANDOM_URL, timeout=20)
             resp.raise_for_status()
         except Exception:
-            logger.exception('Failed to fetch random question from db.chgk.info (attempt %d)', attempt)
+            logger.exception('Failed to fetch from db.chgk.info (attempt %d)', attempt)
+            if attempt >= 3:
+                return None  # give up early — site is likely down
             continue
 
         root = ElementTree.fromstring(resp.content)
@@ -146,8 +178,123 @@ def fetch_random_question():
             'comment_text': comment_text,
         }
 
-    logger.error('Could not fetch a new unique question after %d attempts', CHGK_MAX_RETRIES)
     return None
+
+
+def _fetch_from_gotquestions():
+    """Fetch a random question from gotquestions.online by scraping a question page."""
+    import random as _rnd
+
+    for attempt in range(1, GQ_MAX_RETRIES + 1):
+        qid = _rnd.randint(1, GQ_MAX_QUESTION_ID)
+        try:
+            resp = req.get(
+                GQ_QUESTION_URL.format(qid=qid),
+                headers={'User-Agent': 'Mozilla/5.0'},
+                timeout=20,
+            )
+            if resp.status_code != 200:
+                logger.warning('gotquestions.online returned %d for question %d (attempt %d)', resp.status_code, qid, attempt)
+                continue
+        except Exception:
+            logger.exception('Failed to fetch from gotquestions.online (attempt %d)', attempt)
+            if attempt >= 2:
+                return None
+            continue
+
+        question = _parse_gotquestions_html(resp.text, qid)
+        if not question:
+            logger.warning('Could not parse question %d from gotquestions.online (attempt %d)', qid, attempt)
+            continue
+
+        if _is_question_sent(question['question_id']):
+            logger.info('Question %s already sent, retrying (attempt %d)', question['question_id'], attempt)
+            continue
+
+        return question
+
+    return None
+
+
+def _parse_gotquestions_html(html, qid):
+    """Parse question data from gotquestions.online RSC payload embedded in HTML.
+
+    The Next.js RSC Flight payload embeds question JSON with escaped quotes:
+      \\"question\\":{\\"id\\":5000,\\"number\\":23,\\"text\\":\\"...\\",\\"answer\\":\\"...\\",...}
+    We normalise the escaping, extract the JSON object, and parse it.
+    """
+    import json as _json
+
+    # Locate the question object by its characteristic key sequence
+    marker = re.search(r'\\?"question\\?":\{\\?"id\\?":(\d+),\\?"number\\?":', html)
+    if not marker:
+        return None
+
+    # Walk forward from the opening brace to find the matching close
+    start = marker.start() + marker.group().index('{')
+    depth, i = 0, start
+    while i < len(html):
+        ch = html[i]
+        if ch == '\\' and i + 1 < len(html):
+            i += 2  # skip escaped char
+            continue
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    raw = html[start : i + 1]
+
+    # Normalise RSC double-escaping: \\" → "  and \\\\n → \\n  etc.
+    normalised = raw.replace('\\"', '"').replace('\\\\', '\\')
+
+    try:
+        obj = _json.loads(normalised)
+    except _json.JSONDecodeError:
+        return None
+
+    gq_id = str(obj.get('id', ''))
+    question_text = (obj.get('text') or '').strip()
+    answer_text = (obj.get('answer') or '').strip()
+    comment_text = (obj.get('comment') or '').strip() or None
+
+    if not gq_id or not question_text or not answer_text:
+        return None
+
+    return {
+        'question_id': f'gq-{gq_id}',
+        'question_text': question_text,
+        'answer_text': answer_text,
+        'comment_text': comment_text,
+    }
+
+
+def _fetch_from_db_pool():
+    """Pick a random previously-fetched question that was never sent (DB pool fallback)."""
+    with closing(get_db_connection()) as conn, conn.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT question_id, question_text, answer_text, comment_text
+            FROM quizplease.chgk_sent_questions
+            WHERE answer_sent = TRUE
+              AND sent_at < %s - INTERVAL '30 days'
+            ORDER BY random()
+            LIMIT 1
+            """,
+            (pdl.today().to_date_string(),),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+
+    return {
+        'question_id': row[0],
+        'question_text': row[1],
+        'answer_text': row[2],
+        'comment_text': row[3],
+    }
 
 
 def _is_question_sent(question_id):
@@ -164,8 +311,13 @@ def save_question(question, message_id):
             cursor.execute(
                 """
                 INSERT INTO quizplease.chgk_sent_questions
-                    (question_id, question_text, answer_text, comment_text, message_id)
-                VALUES (%s, %s, %s, %s, %s)
+                    (question_id, question_text, answer_text, comment_text, message_id, question_source)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (question_id) DO UPDATE
+                    SET message_id = EXCLUDED.message_id,
+                        sent_at = now(),
+                        answer_sent = FALSE,
+                        question_source = EXCLUDED.question_source
                 """,
                 (
                     question['question_id'],
@@ -173,10 +325,11 @@ def save_question(question, message_id):
                     question['answer_text'],
                     question['comment_text'],
                     message_id,
+                    question.get('source', 'db.chgk.info'),
                 ),
             )
         conn.commit()
-    logger.info('Saved question %s (message_id=%s)', question['question_id'], message_id)
+    logger.info('Saved question %s (message_id=%s, source=%s)', question['question_id'], message_id, question.get('source'))
 
 
 def get_pending_answer():
@@ -247,7 +400,7 @@ def _handle_send_question(question_only=False):
     try:
         question = fetch_random_question()
         if question:
-            q_part = f'❓ Вопрос дня:\n\n{question["question_text"]}\n\n🕐 Ответ будет в 16:00'
+            q_part = f'❓ Вопрос дня:\n\n{question["question_text"]}\n\n🕐 Ответ будет в 16:00.'
             message = f'{message}\n\n{q_part}'.strip()
         else:
             logger.warning('No ЧГК question fetched today')
