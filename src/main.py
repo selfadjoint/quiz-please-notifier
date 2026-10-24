@@ -519,6 +519,11 @@ def _parse_gotquestions_html(html, qid):
     if not gq_id or not question_text or not answer_text:
         return None
 
+    # Handout may be plain text (razdatkaText) rather than an image — prepend it to the question
+    razdatka_text = (obj.get('razdatkaText') or '').strip()
+    if razdatka_text:
+        question_text = f'Раздаточный материал:\n{razdatka_text}\n\n{question_text}'
+
     # razdatkaPic is the handout image shown to players — include it if present
     GQ_BASE = 'https://gotquestions.online'
 
@@ -633,10 +638,10 @@ def _fetch_from_db_pool():
     with closing(get_db_connection()) as conn, conn.cursor() as cursor:
         cursor.execute(
             """
-            SELECT question_id, question_text, answer_text, comment_text
+            SELECT question_id, question_text, answer_text, comment_text, image_urls, answer_image_urls
             FROM quizplease.chgk_sent_questions
             WHERE answer_sent = TRUE
-              AND sent_at < %s - INTERVAL '30 days'
+              AND sent_at < %s::date - INTERVAL '30 days'
             ORDER BY random()
             LIMIT 1
             """,
@@ -651,6 +656,8 @@ def _fetch_from_db_pool():
         'question_text': row[1],
         'answer_text': row[2],
         'comment_text': row[3],
+        'image_urls': _json.loads(row[4]) if row[4] else [],
+        'answer_image_urls': _json.loads(row[5]) if row[5] else [],
     }
 
 
@@ -665,6 +672,8 @@ def save_question(question, message_id):
     """Insert a sent question into the tracking table."""
     import json as _json
 
+    image_urls = question.get('image_urls') or []
+    image_urls_json = _json.dumps(image_urls) if image_urls else None
     answer_image_urls = question.get('answer_image_urls') or []
     answer_image_urls_json = _json.dumps(answer_image_urls) if answer_image_urls else None
 
@@ -673,13 +682,15 @@ def save_question(question, message_id):
             cursor.execute(
                 """
                 INSERT INTO quizplease.chgk_sent_questions
-                    (question_id, question_text, answer_text, comment_text, message_id, question_source, answer_image_urls)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    (question_id, question_text, answer_text, comment_text, message_id, question_source,
+                     image_urls, answer_image_urls)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (question_id) DO UPDATE
                     SET message_id = EXCLUDED.message_id,
                         sent_at = now(),
                         answer_sent = FALSE,
                         question_source = EXCLUDED.question_source,
+                        image_urls = EXCLUDED.image_urls,
                         answer_image_urls = EXCLUDED.answer_image_urls
                 """,
                 (
@@ -689,6 +700,7 @@ def save_question(question, message_id):
                     question['comment_text'],
                     message_id,
                     question.get('source', 'db.chgk.info'),
+                    image_urls_json,
                     answer_image_urls_json,
                 ),
             )
