@@ -318,8 +318,16 @@ def _parse_gotquestions_html(html, qid):
     """
     import json as _json
 
-    # Locate the question object by its characteristic key sequence
-    marker = re.search(r'\\?"question\\?":\{\\?"id\\?":(\d+),\\?"number\\?":', html)
+    # Locate the question object by its characteristic key sequence. The page also embeds an unrelated
+    # promo question (always answered "404") before the real one, so match on the requested ID.
+    marker = next(
+        (
+            m
+            for m in re.finditer(r'\\?"question\\?":\{\\?"id\\?":(\d+),\\?"number\\?":', html)
+            if m.group(1) == str(qid)
+        ),
+        None,
+    )
     if not marker:
         return None
 
