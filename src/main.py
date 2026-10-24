@@ -55,16 +55,24 @@ def game_today():
     """
     try:
         with closing(get_db_connection()) as conn, conn.cursor() as cursor:
+            today = pdl.today().to_date_string()
             cursor.execute(
                 """
-                SELECT game_id, game_time, game_venue
+                SELECT game_id::TEXT, game_time, game_venue
                 FROM quizplease.game_registration_overview
                 WHERE game_date = %s
                   AND is_poll_created = TRUE
-                ORDER BY game_time NULLS LAST, game_id
+                UNION ALL
+                SELECT gt.game_id, gd.game_time, gd.venue
+                FROM quizplease.game_tracking gt
+                JOIN quizplease.game_details gd ON gd.id = gt.game_id
+                WHERE gd.game_date = %s
+                  AND gt.poll_created = TRUE
+                  AND (gt.is_cancelled = FALSE OR gt.is_cancelled IS NULL)
+                ORDER BY 2 NULLS LAST, 1
                 LIMIT 1
                 """,
-                (pdl.today().to_date_string(),),
+                (today, today),
             )
             game_info = cursor.fetchone()
 
@@ -545,14 +553,20 @@ def _save_poll_offset(offset):
 def _get_active_poll_ids():
     """Return poll_ids for games today or later."""
     with closing(get_db_connection()) as conn, conn.cursor() as cursor:
+        today = pdl.today().to_date_string()
         cursor.execute(
             """
             SELECT p.poll_id
             FROM quizplease.polls p
-            JOIN quizplease.game_registration_overview g ON g.game_id = p.game_id
+            JOIN quizplease.game_registration_overview g ON g.game_id::TEXT = p.game_id
             WHERE g.game_date >= %s
+            UNION
+            SELECT p.poll_id
+            FROM quizplease.polls p
+            JOIN quizplease.game_details gd ON gd.id = p.game_id
+            WHERE gd.game_date >= %s
             """,
-            (pdl.today().to_date_string(),),
+            (today, today),
         )
         return {row[0] for row in cursor.fetchall()}
 
