@@ -1,3 +1,4 @@
+import html as html_lib
 import logging
 import os
 import re
@@ -22,10 +23,26 @@ CHGK_RANDOM_URL = 'https://db.chgk.info/xml/random/types1/limit1'
 CHGK_IMAGE_BASE_URL = 'https://db.chgk.info/images/db/'
 CHGK_MAX_RETRIES = 10
 
+# HTML fallback for when db.chgk.info's XML/search backend is down but the site itself is up:
+# /last lists real tour slugs (direct DB view, not search-index-backed), and tour pages render
+# questions directly — both routes stay alive independently of the broken XML API.
+CHGK_LAST_URL = 'https://db.chgk.info/last'
+CHGK_TOUR_URL = 'https://db.chgk.info/tour/{slug}'
+CHGK_LAST_MAX_PAGE = 250  # /last?page=N runs dry past this; keeps the sample pool to real tours
+CHGK_HTML_MAX_RETRIES = 5
+
 # gotquestions.online: ~250k questions with sequential IDs; we pick a random ID from 1..MAX_GQ_QUESTION_ID
 GQ_QUESTION_URL = 'https://gotquestions.online/question/{qid}'
 GQ_MAX_QUESTION_ID = 240_000
 GQ_MAX_RETRIES = 5
+
+# questions.chgk.info: an independent legacy mirror (separate server/codebase from db.chgk.info)
+# with its own working random-question endpoint. HTTPS cert is expired — http only. No stable
+# per-question ID, so we hash the question text for a synthetic one; most draws also omit
+# Author/Source/Comments (older, simpler records), though some do carry a comment.
+QCHGK_BASE_URL = 'http://questions.chgk.info'
+QCHGK_RANDOM_URL = f'{QCHGK_BASE_URL}/cgi-bin/db.cgi'
+QCHGK_MAX_RETRIES = 5
 
 POLL_OPTIONS = ['Иду', '+1', 'Не иду']
 POLL_OPTION_GOING = 0
@@ -151,10 +168,11 @@ def send_media_group(_bot_token, _group_id, photo_urls, reply_to_message_id=None
 
 
 def _clean_html(text):
-    """Remove simple HTML tags and collapse whitespace."""
+    """Remove simple HTML tags, decode HTML entities, and collapse whitespace."""
     if not text:
         return text
     text = re.sub(r'<[^>]+>', ' ', text)
+    text = html_lib.unescape(text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
@@ -209,13 +227,17 @@ def send_question_message(_bot_token, _group_id, full_message, question_text, im
 def fetch_random_question():
     """
     Fetches a random ЧГК question from multiple sources, trying each in order:
-    1. db.chgk.info XML API (primary)
-    2. gotquestions.online HTML scraping (secondary)
-    3. DB pool — a previously fetched but never-sent question (fallback)
+    1. questions.chgk.info — independent legacy mirror, fast and currently the most reliable
+    2. db.chgk.info XML API
+    3. db.chgk.info HTML scraping — tour pages via /last, bypasses the XML/search backend
+    4. gotquestions.online HTML scraping
+    5. DB pool — a previously fetched but never-sent question (fallback)
     Returns a dict with question_id, question_text, answer_text, comment_text, source or None.
     """
     sources = [
+        ('questions.chgk.info', _fetch_from_questions_chgk),
         ('db.chgk.info', _fetch_from_dbchgk),
+        ('db.chgk.info-html', _fetch_from_dbchgk_html),
         ('gotquestions.online', _fetch_from_gotquestions),
         ('db_pool', _fetch_from_db_pool),
     ]
@@ -277,6 +299,131 @@ def _fetch_from_dbchgk():
             'comment_text': comment_text,
             'image_urls': image_urls,
             'answer_image_urls': all_answer_image_urls,
+        }
+
+    return None
+
+
+_CHGK_QUESTION_DIV_RE = re.compile(r'<div class="question" id="([^"]+)">')
+_CHGK_TOUR_SLUG_RE = re.compile(r'href="/tour/([^"/?]+)"')
+_CHGK_RAZDATKA_RE = re.compile(r'<div class="razdatka"><div class="razdatka_header">[^<]*</div>(.*?)</div>', re.S)
+_CHGK_IMG_SRC_RE = re.compile(r'<img[^>]+src="([^"]+)"')
+_CHGK_COLLAPSIBLE_RE = re.compile(r"<div class=['\"]collapsible")
+_CHGK_REPORT_LINK_RE = re.compile(r'<a href="https://db\.chgk\.info/contact/.*?</a>', re.S)
+
+
+def _fetch_from_dbchgk_html():
+    """Fallback ЧГК source: scrape db.chgk.info tour pages directly.
+
+    db.chgk.info's XML/search backend can go down (returns empty results everywhere)
+    while the site's own content pages keep working fine — /last (a plain "recently
+    added" listing, not search-index-backed) gives real tour slugs, and /tour/{slug}
+    renders the questions directly.
+    """
+    import random as _rnd
+
+    for attempt in range(1, CHGK_HTML_MAX_RETRIES + 1):
+        try:
+            page = _rnd.randint(0, CHGK_LAST_MAX_PAGE)
+            last_resp = req.get(f'{CHGK_LAST_URL}?page={page}', timeout=20)
+            last_resp.raise_for_status()
+            slugs = sorted(set(_CHGK_TOUR_SLUG_RE.findall(last_resp.text)))
+            if not slugs:
+                logger.warning('No tour slugs found on db.chgk.info /last?page=%d (attempt %d)', page, attempt)
+                continue
+
+            slug = _rnd.choice(slugs)
+            tour_resp = req.get(CHGK_TOUR_URL.format(slug=slug), timeout=20)
+            tour_resp.raise_for_status()
+        except Exception:
+            logger.exception('Failed to fetch from db.chgk.info HTML (attempt %d)', attempt)
+            continue
+
+        question = _parse_dbchgk_tour_html(tour_resp.text)
+        if not question:
+            logger.warning('Could not parse a question from tour %s (attempt %d)', slug, attempt)
+            continue
+
+        if _is_question_sent(question['question_id']):
+            logger.info('Question %s already sent, retrying (attempt %d)', question['question_id'], attempt)
+            continue
+
+        return question
+
+    return None
+
+
+def _strip_razdatka(block_html):
+    """Pull the (optional) handout block out of a question/answer HTML chunk.
+
+    Returns (remaining_html, handout_text_or_None, image_urls). The handout is
+    either image(s) or plain text (never both in practice) — mirrors the
+    razdatkaPic/razdatkaText split on gotquestions.online.
+    """
+    m = _CHGK_RAZDATKA_RE.search(block_html)
+    if not m:
+        return block_html, None, []
+    content = m.group(1)
+    image_urls = _CHGK_IMG_SRC_RE.findall(content)
+    remaining = block_html[: m.start()] + block_html[m.end() :]
+    handout_text = None if image_urls else (_clean_html(content) or None)
+    return remaining, handout_text, image_urls
+
+
+def _extract_dbchgk_field(label_class, block_html):
+    """Extract the text + any images of a `<strong class="{label_class}">...</strong> text</p>` field."""
+    m = re.search(rf'<strong class="{label_class}">.*?</strong>\s*(.*?)</p>', block_html, re.S)
+    if not m:
+        return None, []
+    content = m.group(1)
+    return _clean_html(content) or None, _CHGK_IMG_SRC_RE.findall(content)
+
+
+def _parse_dbchgk_tour_html(tour_html):
+    """Pick a random fully-formed question out of a db.chgk.info tour page."""
+    import random as _rnd
+
+    matches = list(_CHGK_QUESTION_DIV_RE.finditer(tour_html))
+    _rnd.shuffle(matches)
+
+    for i, m in enumerate(matches):
+        text_id = m.group(1)
+        start = m.end()
+        end = len(tour_html)
+        for other in matches:
+            if other.start() > start:
+                end = min(end, other.start())
+        footer = re.search(r"<div class='editor'>|<h2>", tour_html[start:end])
+        if footer:
+            end = min(end, start + footer.start())
+        block = tour_html[start:end]
+
+        split = _CHGK_COLLAPSIBLE_RE.search(block)
+        if not split:
+            continue
+        question_part, answer_part = block[: split.start()], block[split.start() :]
+        answer_part = _CHGK_REPORT_LINK_RE.sub('', answer_part)
+
+        # drop the "Вопрос N:" label itself, keep the razdatka + question body after it
+        question_part = re.sub(r'^.*?</strong>\s*', '', question_part, count=1, flags=re.S)
+        question_part, handout_text, image_urls = _strip_razdatka(question_part)
+        question_text = _clean_html(question_part)
+        if handout_text:
+            question_text = f'Раздаточный материал:\n{handout_text}\n\n{question_text}'
+
+        answer_text, answer_images = _extract_dbchgk_field('Answer', answer_part)
+        comment_text, comment_images = _extract_dbchgk_field('Comments', answer_part)
+
+        if not text_id or not question_text or not answer_text:
+            continue
+
+        return {
+            'question_id': text_id,
+            'question_text': question_text,
+            'answer_text': answer_text,
+            'comment_text': comment_text,
+            'image_urls': image_urls,
+            'answer_image_urls': answer_images + comment_images,
         }
 
     return None
@@ -394,8 +541,95 @@ def _parse_gotquestions_html(html, qid):
     }
 
 
+_QCHGK_QUESTION_RE = re.compile(r'<strong>Вопрос 1: </strong>(.*?)<p\s*/>', re.S)
+_QCHGK_ANSWER_RE = re.compile(r'<b>Ответ 1: </b>(.*?)<p\s*/>', re.S)
+_QCHGK_RAZDATKA_RE = re.compile(r"<div class='razdatka'><div class='razdatka_header'>[^<]*</div>(.*?)</div>", re.S)
+# Most random draws from this mirror omit Author/Source/Comments entirely (older, simpler
+# records), but some don't — pick up a comment opportunistically when one is present.
+_QCHGK_COMMENT_RE = re.compile(r'<b>Комментари\w*\s*\d*:\s*</b>(.*?)<p\s*/>', re.S)
+
+
+def _qchgk_resolve_images(raw_html):
+    """Resolve <img> src attributes found in a questions.chgk.info fragment to absolute URLs."""
+    return [u if u.startswith('http') else QCHGK_BASE_URL + u for u in _CHGK_IMG_SRC_RE.findall(raw_html)]
+
+
+def _fetch_from_questions_chgk():
+    """Fallback ЧГК source: questions.chgk.info, an independent legacy mirror of the ЧГК
+    question DB — a separate server/codebase from db.chgk.info, so it stays up even when
+    db.chgk.info itself (not just its search backend) is unreachable. Has no stable
+    per-question ID (we hash the question text for one) and usually no comment field
+    (older, simpler records), though some draws do carry one.
+    """
+    import hashlib
+
+    for attempt in range(1, QCHGK_MAX_RETRIES + 1):
+        try:
+            resp = req.get(
+                QCHGK_RANDOM_URL,
+                params={'qnum': 1, 'type': 'chgk', 'razd': 1, 'rand': 'yes'},
+                timeout=20,
+            )
+            resp.raise_for_status()
+            page = resp.text  # requests honours the charset=koi8-r in the Content-Type header
+        except Exception:
+            logger.exception('Failed to fetch from questions.chgk.info (attempt %d)', attempt)
+            continue
+
+        q_match = _QCHGK_QUESTION_RE.search(page)
+        a_match = _QCHGK_ANSWER_RE.search(page)
+        if not q_match or not a_match:
+            logger.warning('Could not parse questions.chgk.info response (attempt %d)', attempt)
+            continue
+
+        question_part = q_match.group(1)
+        razdatka = _QCHGK_RAZDATKA_RE.search(question_part)
+        handout_text = None
+        if razdatka:
+            handout_content = razdatka.group(1)
+            if not _CHGK_IMG_SRC_RE.search(handout_content):
+                handout_text = _clean_html(handout_content) or None
+            question_part = question_part[: razdatka.start()] + question_part[razdatka.end() :]
+
+        image_urls = _qchgk_resolve_images(q_match.group(1))
+        question_text = _clean_html(question_part)
+        if handout_text:
+            question_text = f'Раздаточный материал:\n{handout_text}\n\n{question_text}'
+
+        answer_raw = a_match.group(1)
+        answer_text = _clean_html(answer_raw)
+        answer_image_urls = _qchgk_resolve_images(answer_raw)
+
+        comment_match = _QCHGK_COMMENT_RE.search(page, pos=a_match.end())
+        comment_text = _clean_html(comment_match.group(1)) if comment_match else None
+        if comment_match:
+            answer_image_urls += _qchgk_resolve_images(comment_match.group(1))
+
+        if not question_text or not answer_text:
+            logger.warning('Incomplete question data from questions.chgk.info (attempt %d)', attempt)
+            continue
+
+        question_id = 'qchgk-' + hashlib.md5(question_text.encode('utf-8')).hexdigest()[:16]
+        if _is_question_sent(question_id):
+            logger.info('Question %s already sent, retrying (attempt %d)', question_id, attempt)
+            continue
+
+        return {
+            'question_id': question_id,
+            'question_text': question_text,
+            'answer_text': answer_text,
+            'comment_text': comment_text,
+            'image_urls': image_urls,
+            'answer_image_urls': answer_image_urls,
+        }
+
+    return None
+
+
 def _fetch_from_db_pool():
     """Pick a random previously-fetched question that was never sent (DB pool fallback)."""
+    import json as _json
+
     with closing(get_db_connection()) as conn, conn.cursor() as cursor:
         cursor.execute(
             """
