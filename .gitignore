@@ -1,0 +1,14 @@
+.idea/
+__pycache__/
+
+# Vendored Lambda deps (pip install --target ./src); only our own files are tracked
+src/*
+!src/main.py
+!src/requirements.txt
+
+# Terraform local state, plans, build artifacts and secrets
+terraform/.terraform/
+terraform/lambda.zip
+terraform/tfplan
+terraform/backend.hcl
+terraform/terraform.tfvars
